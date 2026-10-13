@@ -2,6 +2,7 @@
 
 | Experiment | Decision / qualification |
 | --- | --- |
+| Long FP32 prefill LDS limit | Fix under qualification: the fallback exceeded gfx1151's 64 KiB workgroup limit at 16K (66,560 bytes). Long rows now use existing scalar online arithmetic with bounded memory. FP16/FP32 operator checks through 100K match an independent FP64 oracle, scalar online bytes and BF16 rounding. The current binary passes Q4 FP32 and Q4/Q8 FP16 at both 32K/100K, and Q8 FP32 at 32K, with exact component restores and continued full logits/tokens. Q8 FP32 at 100K and matched production timing remain pending. |
 | Conversation checkpoints | Retained: bounded edit checkpoints and advancing conversation boundaries. Q4/Q8 AR and DFlash2 cancellation, image replay and disk restart pass; Q4 edits and growing histories match cold answer controls. [Functional checks](../../../tests/functional/README.md). |
 | Bounded prefill submission for cancellation | Retained: Q4/Q8 AR resume in 302/412 ms after a prefill disconnect; DFlash2 in 214/281 ms. Exact image/snapshot logits and seeded replay; matched 2,504-token C1 prefill times remain within 1.7% across all four modes. Two reusable events, no tensor allocation or arithmetic change. |
 | Quantized verification row groups | Retained per shape; scalar FP32 bits, full target logits and private acceptance/RNG must match. |
