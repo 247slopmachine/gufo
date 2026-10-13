@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #include "qfn_mmq.h"
+#include "src/core/hip/managed_alloc.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
@@ -124,10 +125,11 @@ void Executor::UseScratch(const Scratch& scratch) const {
 
 bool Executor::AllocateBatch(std::string* error) const {
   return batch_logits_ != nullptr ||
-         Check(hipMalloc(&batch_logits_,
-                         static_cast<std::size_t>(kBatchSessions) *
-                             std::min(kDecodeRows, options_.max_logit_rows) *
-                             config().vocab_size * sizeof(float)),
+         Check(hip::AllocateDevice(
+                   &batch_logits_,
+                   static_cast<std::size_t>(kBatchSessions) *
+                       std::min(kDecodeRows, options_.max_logit_rows) *
+                       config().vocab_size * sizeof(float)),
                error);
 }
 
@@ -212,6 +214,16 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
   if (items.size() == 1) {
     const auto& item = items.front();
     return MtpForward(*item.session, item.tokens, item.hidden_row, {}, error);
+  }
+  for (const auto& item : items) {
+    auto& session = *item.session;
+    if (!session.Cancelled() && session.continuation_hooks_) {
+      const auto end = session.mtp_.position +
+                       static_cast<std::uint32_t>(item.tokens.size());
+      session.continuation_hooks_->BeforeWrite(
+          true, session.mtp_.position, end, session.mtp_.blocks,
+          end > c.indexer_top_k ? end / c.compress_ratio : session.mtp_.blocks);
+    }
   }
   for (const auto& item : items)
     if (!item.session->Cancelled())
@@ -697,6 +709,16 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   }
   if (!AnyActive(items))
     return true;
+  for (const auto& item : items) {
+    auto& session = *item.session;
+    if (!session.Cancelled() && session.continuation_hooks_) {
+      const auto end =
+          session.position_ + static_cast<std::uint32_t>(item.tokens.size());
+      session.continuation_hooks_->BeforeWrite(
+          false, session.position_, end, session.blocks_,
+          end > c.indexer_top_k ? end / c.compress_ratio : session.blocks_);
+    }
+  }
   for (const auto& item : items) {
     if (!item.session->Cancelled())
       item.session->PreserveSnapshots(item.session->position_,

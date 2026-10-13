@@ -11,7 +11,7 @@ fields return explicit errors.
 
 Chat Completions is the main API, including streaming, images and tools.
 Responses supports text, images and function tools with optional streaming.
-Anthropic Messages exposes a synchronous text subset.
+Anthropic Messages supports text, images and custom tools.
 The reference protocols are:
 
 - https://developers.openai.com/api/reference/resources/responses/methods/create/
@@ -91,7 +91,7 @@ available memory.
 Text sampling follows each model's recommended defaults in `serve`, `prompt`
 and `chat`. Explicit request values override explicit server options, which
 otherwise inherit the effective thinking preset. Null request values inherit
-where supported; explicit zero values are preserved (`top_p` must remain positive).
+where supported; explicit zero values, including `top_p: 0`, are preserved.
 The startup sampling log reports server defaults; requests can override each
 setting independently, including when changing thinking mode.
 
@@ -183,17 +183,26 @@ movable pages, not GPU allocations. 27B also checks HIP free memory. A
 positive value sets a byte cap that may exceed the automatic budget, up to the
 available host RAM minus 4 GiB; the startup line reports both as
 `automatic_bytes` and `max_bytes`.
-Disk staging and temporary disk-save buffers are separate from this RAM budget.
+On Flash-Next, the pinned disk staging buffer comes out of that ceiling, and
+`max_bytes` excludes it. Other models' disk staging and temporary disk-save
+buffers are separate from this RAM budget.
 The 128 checkpoint records are independent of `--sessions`; more than one can
 belong to a conversation.
-Payloads are allocated only when captured. Under pressure, optional copies
-give way before another conversation's last useful checkpoint.
+Qwen3.8-Flash-Next pins pages for up to about 89% of its budget as captures
+need them, about 1 GiB at a time, and keeps them; the rest covers cache metadata as
+it grows. A step takes about 60 ms while the host has free pages and longer when
+the kernel must reclaim page cache. Growth stops early while the host would keep
+less than 4 GiB available. The pages hold checkpoint state and KV rows, partial
+tails and idle-session spill; there is no separate spill option.
+Other models allocate payloads only when captured. Under pressure, optional
+copies give way before another conversation's last useful checkpoint.
 
 Prompt reuse is enabled by default; how the cache finds, retains and
 evicts that state is described in [the KV cache](KV-CACHE.md).
 `cache_prompt: false` on
-`/v1/chat/completions` or `/v1/responses` bypasses memory and disk lookup for
-that request; the result can still populate the cache. DeepSeek and Qwen tool
+`/v1/chat/completions`, `/v1/responses`, `/v1/completions` or `/completion`
+bypasses memory and disk lookup for that request; the result can still
+populate the cache. `null` keeps the default, `true`. DeepSeek and Qwen tool
 requests retain a checkpoint before the assistant-generation suffix, including
 when a client drops the interrupted assistant and appends `"."` after a tool result. DeepSeek
 also accounts for tokenization changes where adjacent user/tool turns join.
@@ -217,18 +226,35 @@ its changed suffix again.
 
 `SIGINT` and `SIGTERM` cancel active requests and drain accepted disk writes
 before exiting. `--cache-disk DIR` defaults to 8 GiB retained on disk.
-`--cache-disk-staging-bytes 0` (the default) selects the smaller of one eighth
-of available host RAM after model/session loading (including cgroup limits) and
-the disk budget. This bounds queued captures/writes and each disk read
-separately; it allocates nothing upfront. Live model state and retained RAM
-snapshots have separate budgets.
 
+On Flash-Next, `--cache-disk-bytes` counts every file the cache manages,
+including temporary files of unfinished writes and files a crash left
+unreferenced. Restarting with a lower budget removes those first, then the
+oldest checkpoints by creation order, until the directory fits; use history does not
+survive a restart. One Flash-Next server owns the directory: a second one fails
+at startup, after loading its model but before committing its RAM budget, with
+an ownership error naming the directory. The lock does not wait: a restarted
+server fails if its predecessor is still draining disk writes when the new one
+finishes loading its model. Other models do not take this lock.
+The first start on a directory written by an earlier release removes its old
+checkpoint files (`*.kvc`), and the cache refills as conversations run. Do not
+share a directory between Flash-Next and other models; Flash-Next removes
+their checkpoint and temporary files too, including writes in progress.
+Flash-Next ignores `--cache-disk-staging-bytes` and logs
+`event=option_ignored`. Writes and restores stream each checkpoint through an
+internal 1 MiB pinned buffer, piece by piece; a larger buffer did not change
+restore or write speed and took pinned RAM and device heap from the cache and
+the sessions. Remove the option from Flash-Next command lines.
+
+For the other models, `--cache-disk-staging-bytes 0` (the default) selects the
+smaller of one eighth of available host RAM after model/session loading
+(including cgroup limits) and the disk budget. This bounds queued
+captures/writes and each disk read separately; it allocates nothing upfront.
+Live model state and retained RAM snapshots have separate budgets.
 Snapshots that exceed either limit are skipped with their required size and
 available budget logged; live conversation reuse remains available. Existing
 files that exceed the current staging limit are preserved subject to disk LRU
 eviction and can be reused after restarting with sufficient staging.
-For Flash-Next/MTP at full 262K context, explicitly set
-`--cache-disk-staging-bytes 8589934592` (8 GiB) if RAM permits.
 Qwen27B at full context needs larger staging and `--cache-disk-bytes` limits;
 use the required size reported in the skip log.
 
@@ -606,7 +632,7 @@ The other compatibility routes are deliberately limited:
 | Route | Supported request | Output limit |
 | --- | --- | --- |
 | `/v1/completions` | One prompt string, buffered or SSE completion | `max_tokens` |
-| `/v1/messages` | Text, thinking and tool blocks, optional text system instructions and custom tools; buffered or SSE | `max_tokens` |
+| `/v1/messages` | Text, image, thinking and tool blocks, optional text system instructions and custom tools; buffered or SSE | `max_tokens` |
 | `/completion` | One prompt string, non-streaming completion | `n_predict` |
 
 All four routes validate the loaded model, positive integer limits and shared
@@ -633,10 +659,23 @@ reasoning effort used while thinking is on; it never enables thinking. Other
 constraints and cache reuse match Chat Completions. Calls are returned as
 `tool_use` blocks with `stop_reason: "tool_use"`; replay them unchanged with
 the following `tool_result` blocks. Server tools such as `web_search` are
-rejected. Completions routes accept `stop`;
+rejected. Messages accepts `image` blocks in user turns and in `tool_result`
+content, with a `base64` source (PNG, JPEG or WebP) or an HTTPS `url` source,
+under the same limits and model requirements as Chat Completions images;
+images in assistant turns, `file` sources and `document` blocks are rejected.
+Completions routes accept `stop`;
 Messages accepts `stop_sequences`. Responses has no stop-sequence field.
-`/infill` and `/v1/messages/count_tokens` return 501: suffix-conditioned infill
-and template-aware message counting are not implemented.
+`POST /v1/messages/count_tokens` accepts the same text, images, system, thinking and
+tool history as Messages and returns `{"input_tokens": N}` after rendering the
+model's chat template. `max_tokens` is optional; `stream: true` is rejected.
+The count includes cached prompt tokens and does not generate, prefill or
+change the conversation cache. Prompts may exceed the configured execution
+context so clients can size them before trimming; generation still enforces
+the context limit. Images use the same resizing and visual token expansion as
+generation, without running the vision encoder; the matching projector must
+be loaded. Models without image support reject image counts with 400.
+Backends without chat counting support return 501. `/infill` still returns 501 because
+suffix-conditioned infill is not implemented.
 
 Raw Completions accepts `stream: true` and
 `stream_options: {"include_usage": true}`. The final usage event reports prompt,
@@ -959,6 +998,25 @@ loss permanent for the process:
   and exits with status 75 (`EX_TEMPFAIL`), also when an external `SIGTERM`
   stops it after the loss. Teardown can block on the dead device, so the
   process exits with status 75 after 10 s regardless.
+
+A device call that never returns is a different failure: nothing fails, so
+nothing is probed, and the server keeps answering `/health` and sending stream
+heartbeats while generation has stopped. `--stall-timeout-ms MS` bounds that.
+Progress means a request being admitted, a work unit starting, a pending
+checkpoint capture completing or the idle wait returning. When the scheduler has work but none of those
+happens for `MS`, it logs
+`event=device_lost remedy=restart reason=scheduler made no progress for <MS> ms`
+and follows the lost-device path above, including the exit with status 75 and
+the `gufo_device_lost_total` increment. This covers a hang on the scheduler
+thread, in a capture the scheduler is waiting for, and in the idle device
+probe. Detection takes between `MS` and about 1.5 times `MS`. Requests already
+in flight end when the process exits. The default, 0, disables the check;
+other values must be at least 60000, because a deep checkpoint capture or a
+post-failure device probe can legitimately hold progress for tens of seconds.
+An idle server and a queued request never count as stalled. While any other
+request is still progressing, a hung capture is not reported; it is once
+nothing else can run. A disk-cache write that never completes is not detected
+while generation continues.
 
 Text streams defer HTTP headers until the scheduler admits the request and
 starts its prompt, or until the request has waited five seconds in the queue,

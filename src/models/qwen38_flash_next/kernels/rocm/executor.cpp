@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "qfn_mmq.h"
+#include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
@@ -47,9 +48,9 @@ T* Alloc(std::vector<void*>& allocations, std::size_t count,
          std::string* error_msg, std::size_t* allocated_bytes = nullptr) {
   void* p = nullptr;
   const std::size_t bytes = std::max<std::size_t>(1, count) * sizeof(T);
-  if (hipMalloc(&p, bytes) != hipSuccess) {
+  if (hip::AllocateDevice(&p, bytes) != hipSuccess) {
     AssignError(error_msg,
-                "hipMalloc of " + std::to_string(bytes) + " bytes failed");
+                "allocation of " + std::to_string(bytes) + " bytes failed");
     allocations.push_back(nullptr);
     return nullptr;
   }
@@ -176,6 +177,16 @@ void PopulateSnapshotPrefix(std::uint8_t* data, std::uint64_t bytes,
 
 namespace {
 constexpr std::uint64_t kSnapshotReuseBytes = 8ULL << 20;
+// Device memory kept free beyond the executor's own lazy scratch, for the
+// runtime and driver. Snapshot storage never grows into it.
+constexpr std::uint64_t kSnapshotDeviceSlackBytes = 512ULL << 20;
+
+/// Snapshot storage would leave too little device memory. Callers keep the
+/// checkpoint in its host payload instead; the request continues.
+class SnapshotDeviceExhausted : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
 }  // namespace
 // Legacy hipFree synchronizes unrelated inference streams. Pool allocations
 // have stream-ordered release, so evicting a checkpoint cannot stall a peer.
@@ -189,7 +200,8 @@ public:
   // HIP calls, so a background refill would land in a peer's decode instead.
   static constexpr std::size_t kSpareBlocks = 2;
 
-  SnapshotAllocator() {
+  /// `reserve` is the device memory every commit leaves free.
+  explicit SnapshotAllocator(std::uint64_t reserve) : reserve_(reserve) {
     hipMemPoolProps properties{};
     properties.allocType = hipMemAllocationTypePinned;
     properties.handleTypes = hipMemHandleTypeNone;
@@ -236,6 +248,17 @@ public:
   [[nodiscard]] static std::uint64_t SpareBytes(std::uint64_t block) {
     return kSpareBlocks * block;
   }
+  /// Whether committing `bytes` keeps the reserve free. The snapshot budget
+  /// counts host payloads, but on an APU the device limit can be lower than
+  /// host RAM. ROCm 7.2's VM pool corrupts its heap when a page commit
+  /// fails, so storage is never requested beyond the device headroom.
+  [[nodiscard]] bool Fits(std::uint64_t bytes) const {
+    std::size_t free = 0;
+    std::size_t total = 0;
+    if (hipMemGetInfo(&free, &total) != hipSuccess)
+      return false;
+    return free >= bytes && free - bytes >= reserve_;
+  }
   /// A transfer on a stream of its own, reused across transfers: creating a
   /// stream can stall for milliseconds, and a shared stream would make a
   /// capture wait for a peer's bulk materialization.
@@ -265,6 +288,8 @@ private:
                                hipGetErrorString(error));
   }
   void* Commit(std::uint64_t bytes) {
+    if (!Fits(bytes))
+      throw SnapshotDeviceExhausted("snapshot storage exceeds device headroom");
     void* data = nullptr;
     CheckStatus(hipMallocFromPoolAsync(&data, bytes, pool_, stream_),
                 "snapshot allocate");
@@ -294,6 +319,7 @@ private:
     // including when their source session has already been destroyed.
     (void)hipStreamSynchronize(stream_);
   }
+  std::uint64_t reserve_;
   std::mutex mutex_;
   std::vector<void*> spares_;
   std::uint64_t spare_bytes_{0};
@@ -305,7 +331,9 @@ private:
 
 std::shared_ptr<SnapshotAllocator> Executor::GetSnapshotAllocator() const {
   std::call_once(snapshot_allocator_once_, [&] {
-    snapshot_allocator_ = std::make_shared<SnapshotAllocator>();
+    // Admission reserved the lazy scratch; snapshots must not consume it.
+    snapshot_allocator_ = std::make_shared<SnapshotAllocator>(
+        DeferredScratchBytes() + kSnapshotDeviceSlackBytes);
   });
   return snapshot_allocator_;
 }
@@ -401,6 +429,10 @@ void SnapshotState::Materialize() const {
   std::lock_guard lock(registry_->mutex);
   if (registry_->failure)
     std::rethrow_exception(registry_->failure);
+  MaterializeLocked();
+}
+
+void SnapshotState::MaterializeLocked() const {
   const auto transfer = registry_->allocator->Transfer();
   for (const auto& region : regions_) {
     PopulateSnapshotPrefix(region.host, region.bytes);
@@ -536,6 +568,8 @@ void SnapshotRegistry::Preserve(std::uint32_t position,
     capacity += block->capacity - block->used;
   // Allocate before enqueuing any copy or changing a checkpoint. Allocation
   // failure then leaves the source and every retained checkpoint intact.
+  std::vector<std::uint64_t> commits;
+  std::uint64_t needed = 0;
   for (std::size_t first = 0; first < copies.size();) {
     auto last = first;
     std::uint64_t bytes = 0;
@@ -548,11 +582,36 @@ void SnapshotRegistry::Preserve(std::uint32_t position,
     capacity -= reused;
     bytes -= reused;
     if (bytes != 0) {
-      auto block = std::make_shared<SnapshotBlock>(allocator, bytes);
-      reserve.push_back(block);
-      available.push_back(std::move(block));
+      commits.push_back(bytes);
+      needed += bytes;
     }
     first = last;
+  }
+  bool device = needed == 0 || allocator->Fits(needed);
+  if (device) {
+    try {
+      for (const auto bytes : commits) {
+        auto block = std::make_shared<SnapshotBlock>(allocator, bytes);
+        reserve.push_back(block);
+        available.push_back(std::move(block));
+      }
+    } catch (const SnapshotDeviceExhausted&) {
+      device = false;
+    }
+  }
+  if (!device) {
+    // No device room for the overwritten rows: move each affected checkpoint
+    // into its host payload, which the snapshot budget already charges. This
+    // also releases the device copies it held from earlier rewinds.
+    std::vector<bool> affected(snapshots.size());
+    for (const auto& copy : copies)
+      for (const auto owner : copy.owners)
+        affected[owner] = true;
+    for (std::size_t index = 0; index < snapshots.size(); ++index)
+      if (affected[index])
+        snapshots[index]->MaterializeLocked();
+    copies.clear();
+    available.clear();
   }
   std::size_t block_index = 0;
   std::unique_ptr<gufo::hip::SnapshotTransfer> transfer;
@@ -823,24 +882,25 @@ void Session::Reset() {
   mtp_.residual_valid = false;
   mtp_.blocks = 0;
   const Config& c = owner_->config();
+  const auto zero = [&](void* pointer, std::size_t bytes) {
+    const auto result = hipMemsetAsync(pointer, 0, bytes, owner_->stream());
+    // Adapter invalidation may report success only after every zero fill was
+    // submitted and completed. Keep legacy cleanup's error policy unchanged.
+    if (result != hipSuccess && continuation_hooks_)
+      throw std::runtime_error(hipGetErrorString(result));
+  };
   for (auto& l : linear_) {
     if (l.state != nullptr) {
-      (void)hipMemsetAsync(l.conv_state, 0,
-                           static_cast<std::size_t>(c.ssm_conv_kernel - 1) *
-                               c.SsmConvChannels() * sizeof(float),
-                           owner_->stream());
-      (void)hipMemsetAsync(l.state, 0,
-                           static_cast<std::size_t>(c.ssm_num_v_heads) *
-                               c.ssm_head_dim * c.ssm_head_dim * sizeof(float),
-                           owner_->stream());
+      zero(l.conv_state, static_cast<std::size_t>(c.ssm_conv_kernel - 1) *
+                             c.SsmConvChannels() * sizeof(float));
+      zero(l.state, static_cast<std::size_t>(c.ssm_num_v_heads) *
+                        c.ssm_head_dim * c.ssm_head_dim * sizeof(float));
     }
   }
   blocks_ = 0;
   if (ple_history_ != nullptr) {
-    (void)hipMemsetAsync(ple_history_, 0,
-                         static_cast<std::size_t>(c.PleConvHistory()) *
-                             c.HcDim() * sizeof(float),
-                         owner_->stream());
+    zero(ple_history_, static_cast<std::size_t>(c.PleConvHistory()) *
+                           c.HcDim() * sizeof(float));
   }
 }
 
@@ -1252,7 +1312,8 @@ bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
                                             c.ssm_num_v_heads, c.ssm_head_dim);
     const auto bytes = (linear * (conv + state) + ple) * sizeof(float);
     float* allocation = nullptr;
-    if (!Check(hipMalloc(&allocation, bytes), "rollback allocation", error_msg))
+    if (!Check(hip::AllocateDevice(&allocation, bytes), "rollback allocation",
+               error_msg))
       return false;
     session.rollback_allocations_.push_back(allocation);
     session.rollback_bytes_ += bytes;
@@ -2718,6 +2779,13 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   } pinned_inputs{stream_};
   // Start the disk rows before protecting checkpoint rows, which can commit
   // device pages: layer 0 alone cannot hide the whole read.
+  if (session.continuation_hooks_) {
+    const auto end =
+        session.position_ + static_cast<std::uint32_t>(tokens.size());
+    session.continuation_hooks_->BeforeWrite(
+        false, session.position_, end, session.blocks_,
+        end > c.indexer_top_k ? end / c.compress_ratio : session.blocks_);
+  }
   const auto ngram = session.ngram_;
   if (c.ple_layer >= 0) {
     if (ngram_ == nullptr) {
@@ -2992,6 +3060,12 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
   if (n == 0 || keep == 0 || keep > n) {
     AssignError(error_msg, "rollback outside the pending speculative batch");
     return false;
+  }
+  if (session.continuation_hooks_ && keep < n) {
+    const auto end = session.spec_base_ + keep;
+    session.continuation_hooks_->BeforeWrite(
+        false, end, session.position_,
+        std::min(session.blocks_, end / c.compress_ratio), session.blocks_);
   }
   session.spec_tokens_ = 0;
   if (logits != nullptr &&
@@ -3320,18 +3394,23 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
                        });
     pending->mutable_offset_ = sizeof(SnapshotHeader);
     pending->mutable_bytes_ = mutable_prefix - sizeof(SnapshotHeader);
-    pending->mutable_storage_ =
-        session.snapshots_->allocator->AllocateSpare(pending->mutable_bytes_);
-    pending->mutable_device_ =
-        static_cast<std::uint8_t*>(pending->mutable_storage_.get());
-    if (extra_bytes != 0) {
-      pending->extra_storage_ =
-          session.snapshots_->allocator->Allocate(extra_bytes);
-      pending->extra_bytes_ = extra_bytes;
+    try {
+      pending->mutable_storage_ =
+          session.snapshots_->allocator->AllocateSpare(pending->mutable_bytes_);
+      pending->mutable_device_ =
+          static_cast<std::uint8_t*>(pending->mutable_storage_.get());
+      if (extra_bytes != 0) {
+        pending->extra_storage_ =
+            session.snapshots_->allocator->Allocate(extra_bytes);
+        pending->extra_bytes_ = extra_bytes;
+      }
+    } catch (const SnapshotDeviceExhausted&) {
+      // No device room to freeze this capture: copy it to its host payload.
+      pending.reset();
     }
-  } else {
-    PopulateSnapshotPrefix(payload.data(), payload.size());
   }
+  if (!pending)
+    PopulateSnapshotPrefix(payload.data(), payload.size());
   std::memcpy(payload.data(), &h, sizeof(h));
   const auto grid_bytes =
       std::size_t{h.image_count} * sizeof(qwen::vision::ImageGrid);
@@ -3775,7 +3854,7 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
       const auto capacity =
           std::max(penalties.size(), 2 * verification_penalty_capacity_);
       sampling::TokenPenalty* allocated = nullptr;
-      if (!Check(hipMalloc(&allocated, capacity * sizeof(*allocated)),
+      if (!Check(hip::AllocateDevice(&allocated, capacity * sizeof(*allocated)),
                  "verification penalty allocation", error_msg))
         return false;
       (void)hipFree(verification_penalties_);
@@ -3859,6 +3938,11 @@ bool Executor::MtpForward(Session& session,
     AssignError(error_msg, "MTP context is full");
     return false;
   }
+  if (session.continuation_hooks_)
+    session.continuation_hooks_->BeforeWrite(
+        true, pos, pos + n, session.mtp_.blocks,
+        pos + n > config().indexer_top_k ? (pos + n) / config().compress_ratio
+                                         : session.mtp_.blocks);
   session.PreserveSnapshots(session.position_, session.mtp_.position);
   ++session.mutation_epoch_;
   session.mtp_.residual_valid = false;
