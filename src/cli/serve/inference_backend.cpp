@@ -827,11 +827,9 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
     // Pages commit as captures need them. A payload cannot span segments,
     // so the edge of each one strands space a ~140 MB private state cannot
     // use; equal segments of about 1 GiB, and at least two private states,
-    // keep that small. A step costs about 60 ms while the host has free
-    // pages (up to seconds when it must reclaim page cache) and does not
-    // stall other HIP work, so it runs ahead on a background thread; only a
-    // capture that outruns it grows on its own thread. Growth stops early
-    // when the host would keep less than its reserve.
+    // keep that small. Page faults and pinning run ahead on a background
+    // thread; only a capture that outruns it grows on its own thread. Growth
+    // stops early when the host would keep less than its reserve.
     std::size_t largest = 0;
     for (const auto& [id, bytes] : backing->component_classes)
       largest = std::max(largest, bytes);
@@ -886,6 +884,8 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
               limited->refused = now;
               return false;
             }});
+    // Commit the first segment ahead of the first request capture too.
+    backing->pool->GrowAhead();
   };
   result->owner = backing;
   result->stream = [backing]() -> std::unique_ptr<cache::Stream> {

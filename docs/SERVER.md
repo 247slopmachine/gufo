@@ -190,9 +190,12 @@ The 128 checkpoint records are independent of `--sessions`; more than one can
 belong to a conversation.
 Qwen27B and Qwen3.8-Flash-Next pin pages for up to about 89% of its budget as captures
 need them, about 1 GiB at a time, and keeps them; the rest covers cache metadata as
-it grows. A step takes about 60 ms while the host has free pages and longer when
-the kernel must reclaim page cache. Growth stops early while the host would keep
-less than 4 GiB available. The pages hold checkpoint state and KV rows, partial
+it grows. The first step runs at startup and later ones on a background thread
+ahead of need. Each takes about 200 ms while the host has free pages and longer
+when the kernel must reclaim page cache. Segments use ordinary pages that are
+registered with HIP: `hipHostMalloc` asks for high-order pages, and compacting
+host memory for them stalled decode for seconds when most RAM belonged to the GPU.
+Growth stops early while the host would keep less than 4 GiB available. The pages hold checkpoint state and KV rows, partial
 tails and idle-session spill; there is no separate spill option.
 Other models allocate payloads only when captured. Under pressure, optional
 copies give way before another conversation's last useful checkpoint.
@@ -854,8 +857,12 @@ Supported: objects, arrays, nullable types, `enum`/`const`, `anyOf`, recursive l
 array length bounds. Formats include date/time, duration, email, hostname,
 IP addresses and UUID.
 
-The root must resolve to an object. Objects require `additionalProperties:false`;
-strict schemas require every property (use null for optional values).
+The root must resolve to an object. As in llama.cpp, an object that declares
+`properties` admits no other keys unless `additionalProperties` is `true` or a
+schema for their values; extra keys then follow the declared properties. An
+object without `properties` admits any keys unless `additionalProperties` is
+`false`. Strict schemas require every property (use null for optional values).
+Tool parameter schemas keep their separate rules below.
 Unsupported keywords, external references and unusable cycles are rejected.
 Schemas are limited to 2 MiB, 5,000 properties, 1,000 enum values and 120,000
 characters in names and enum/const strings. Patterns use ECMA-262 Unicode
@@ -933,8 +940,10 @@ Authorization: Bearer <local-token>
 
 Authentication covers every route, including health, metrics, audio, and video.
 CORS preflight (`OPTIONS`) does not require credentials. Select the listen
-address with `--host`; it must be an IPv4 address. TLS termination belongs in
-a reverse proxy.
+address with `--host`; it must be a numeric IPv4 or IPv6 address, not a host
+name. `--host ::` is dual-stack: it accepts IPv6 clients and IPv4 clients, and
+an IPv4 client keeps its IPv4 address as its client ID. `--host ::1` accepts
+only IPv6 loopback clients. TLS termination belongs in a reverse proxy.
 
 Request bodies, prompts, generated text and credentials are not logged.
 
