@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -13,14 +14,22 @@
 namespace gufo::hip {
 namespace detail {
 namespace {
-// Ordinary anonymous pages, then pinned. hipHostMalloc asks the kernel for
-// high-order pages: when most host RAM belongs to the GPU, that compacts
-// memory and stalls running kernels for up to seconds per GiB. Zero-filled.
+// Ordinary anonymous pages, then registered with the GPU. Host THP policy also
+// applies to mmap: opt out before faulting pages so neither initial population
+// nor later huge-page promotion triggers compaction of this backing.
 void* CommitPages(std::size_t bytes) {
   void* data = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (data == MAP_FAILED)
     return nullptr;
+  // A valid anonymous mapping returns EINVAL for this advice when the kernel
+  // was built without THP; those pages cannot be promoted in the first place.
+  // Populate writable, zero-filled pages before registration in either case.
+  if ((madvise(data, bytes, MADV_NOHUGEPAGE) != 0 && errno != EINVAL) ||
+      madvise(data, bytes, MADV_POPULATE_WRITE) != 0) {
+    munmap(data, bytes);
+    return nullptr;
+  }
   if (hipHostRegister(data, bytes, hipHostRegisterDefault) != hipSuccess) {
     munmap(data, bytes);
     return nullptr;

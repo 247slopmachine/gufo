@@ -1,8 +1,12 @@
+#include <sys/mman.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -123,6 +127,48 @@ constexpr std::size_t metadata = 16 << 10;
 constexpr std::size_t budget = 3 * block_bytes + metadata;
 cache::ResourceLimits Limits(std::size_t bytes = budget) {
   return {bytes, bytes, 0, bytes};
+}
+void BasePageBacking() {
+  // A registered anonymous mapping is still eligible for THP collapse unless
+  // its allocation opts out. Collapsing it can invalidate the GPU's mapping.
+  // Exercise the real kernel on our own pages, without changing host policy.
+  constexpr std::size_t huge = 2ULL << 20;
+  constexpr std::size_t bytes = 4 * huge;
+  constexpr std::size_t capacity = bytes + metadata;
+  cache::ResourceLedger ledger(Limits(capacity));
+  {
+    hip::CommittedBackingPool pool(ledger, {capacity, bytes, metadata});
+    auto block = pool.TryAcquire(Category::kPrivateState);
+    assert(block);
+    auto data = block->Bytes();
+    // Registration must not leave deferred faults for the first snapshot.
+    std::array<unsigned char, bytes / 4096> resident{};
+    assert(mincore(data.data(), data.size(), resident.data()) == 0);
+    assert(std::all_of(resident.begin(), resident.end(),
+                       [](unsigned char page) { return page & 1; }));
+    assert(std::all_of(data.begin(), data.end(),
+                       [](std::byte b) { return b == std::byte{}; }));
+    const auto start = reinterpret_cast<std::uintptr_t>(data.data());
+    const auto aligned = (start + huge - 1) & ~(huge - 1);
+    assert(aligned + huge <= start + data.size());
+    errno = 0;
+    const auto collapse =
+        madvise(reinterpret_cast<void*>(aligned), huge, MADV_COLLAPSE);
+    const auto collapse_error = errno;
+    if (collapse != -1 || collapse_error != EINVAL)
+      std::fprintf(stderr, "cache backing collapse returned %d, errno %d\n",
+                   collapse, collapse_error);
+    assert(collapse == -1 && collapse_error == EINVAL);
+    // The non-collapsible pages remain writable by the GPU and readable by
+    // the host, and stay charged until their final owner releases them.
+    void* device = nullptr;
+    assert(hipHostGetDevicePointer(&device, data.data(), 0) == hipSuccess);
+    assert(hipMemset(device, 0x5a, data.size()) == hipSuccess);
+    assert(hipDeviceSynchronize() == hipSuccess);
+    assert(std::all_of(data.begin(), data.end(),
+                       [](std::byte b) { return b == std::byte{0x5a}; }));
+  }
+  assert(ledger.Snapshot().total_bytes == 0);
 }
 void Backing() {
   cache::ResourceLedger ledger(Limits());
@@ -661,6 +707,7 @@ int main() {
   hipDeviceProp_t properties{};
   assert(hipGetDeviceProperties(&properties, 0) == hipSuccess);
   assert(std::strncmp(properties.gcnArchName, "gfx1151", 7) == 0);
+  BasePageBacking();
   Backing();
   GroupedBacking();
   OnDemandBacking();
