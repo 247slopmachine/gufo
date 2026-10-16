@@ -35,7 +35,7 @@ Four independent reviews used fresh context; the early-publication harness
 now waits for the actual scheduler park and verifies its matching release.
 Dedicated parked cancellation/deadline/replacement integration coverage remains
 a limitation. These are regression checks, not upstream model accuracy or a
-global timing pass. [Retained evidence](artifacts/publication-wait-review.json).
+global timing pass.
 
 **PR #603's reduced draft vocabulary preserves the target distribution and
 supports the real sampling defaults.** The final review keeps the established

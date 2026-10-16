@@ -41,7 +41,6 @@ repeat is 46.40 → 46.16 tok/s. Unchanged-main warmup/stall variation reproduce
 All request/phase observations remain retained at 5% and 3 ms: timing evidence
 is **inconclusive and unqualified**, with no confirmed slowdown. This does not
 refresh the complete throughput card below or establish a global timing pass.
-[Publication-wait evidence](artifacts/publication-wait-review.json).
 
 ## Single user, autoregressive
 
