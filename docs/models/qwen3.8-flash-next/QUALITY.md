@@ -1,5 +1,42 @@
 # Qwen3.8 Flash-Next quality
 
+**Publication-wait admission (#621), October 16.** The scheduler bounds a
+pending checkpoint by its useful token gain and eight recent isolated prefill
+samples. It tracks one checkpoint and can shorten its deadline; it cannot
+extend or restart that wait. Without an estimate it uses the available cache.
+Model arithmetic and persistence queue ordering are unchanged.
+
+Production `22e36769`/`1f9672af` controls preserve all waited/retried/cold outputs,
+reasoning and draft counts. The forced timeout now releases at 32.240/34.520 s
+instead of 120 s, and early publication releases the matching checkpoint before
+its budget. Scheduler/cache/runner CPU contracts and existing independent MTP
+operator and sampling checks pass. The four selected profiles (Qwen27B Q8
+AR/DFlash2 and Flash-Next Q4 AR/MTP) complete 272 functional requests across
+long-context, RAM/disk cache, images, cancellation/restart and C2 scheduling.
+Loaded modes and actual drafts are verified. Two sampled partial disk restores
+use the suite's existing non-exact allowance; greedy and zero-prefill contracts
+remain strict. Pi 0.87.0 completes seven HTTP requests at up to 93,285 prompt
+tokens and six real tools; `bonjour`, the corrected addition and all tool
+results were inspected. The Pi server exits 0.
+
+The bounded reporter-pattern run completes 416 requests in 16
+26-turn conversations, at up to 155,587 prompt tokens, with
+12 GiB RAM, a 64 GiB disk budget, a replaced temporary message every turn of
+the second conversation and a restart after cycle four. Maximum admission is
+0.152 s. No publication wait was observed, so the rare natural FIFO backlog remains unconfirmed; the controlled test establishes the bound. The harness forced 2 shutdown(s) after 45 seconds; the HTTP run completed, but this does not qualify graceful shutdown.
+
+Final disk files occupy about 98% of the 64 GiB budget; saturation/eviction is
+not established, so the reporter’s post-capacity regime is not qualified.
+
+Standard AR/MTP pp2048/tg128 controls and focused unchanged-main repeats retain
+exact output/work. Original decode, snapshot, restore and inter-token flags
+remain **inconclusive and unqualified** at 5% and 3 ms; no slowdown is confirmed.
+Four independent reviews used fresh context; the early-publication harness
+now waits for the actual scheduler park and verifies its matching release.
+Dedicated parked cancellation/deadline/replacement integration coverage remains
+a limitation. These are regression checks, not upstream model accuracy or a
+global timing pass. [Retained evidence](artifacts/publication-wait-review.json).
+
 **PR #603's reduced draft vocabulary preserves the target distribution and
 supports the real sampling defaults.** The final review keeps the established
 length controller and AR backoff for every request; it removes the proposed
