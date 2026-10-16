@@ -71,6 +71,11 @@ def run_case(args, command, case, report):
     def published():
         return [int(n) for n in re.findall(r"event=published tokens=(\d+)", log.read_text())]
 
+    def wait_events(stage):
+        return [dict(re.findall(r"(\w+)=([^\s]+)", line))
+                for line in log.read_text().splitlines()
+                if "event=publication_wait " in line and f"stage={stage} " in line]
+
     def chat(label, messages, cache=True):
         body = {"model": option(command, "--served-model-name", "publication-wait"),
                 "messages": messages, "temperature": 0, "seed": 31,
@@ -115,12 +120,18 @@ def run_case(args, command, case, report):
                 "Updated final instruction: reply with only ACK."}]
             with ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(chat, "waiter", follow)
-                timer = threading.Timer(.25 if case == "publish" else 130, release)
-                timer.start()
                 try:
+                    if case == "publish":
+                        starts = wait_until(lambda: wait_events("start"), 60,
+                                            "waiter admission wait")
+                        assert len(starts) == 1, starts
+                        row["wait_start"] = starts[0]
+                    timer = threading.Timer(.25 if case == "publish" else 130, release)
+                    timer.start()
                     waited = future.result(timeout=240)
                 finally:
-                    timer.cancel()
+                    if timer:
+                        timer.cancel()
                     release()
             wait_until(lambda: max(published()) >= 50000, 60, "deep publication")
             retried = chat("retry", follow)
@@ -135,6 +146,15 @@ def run_case(args, command, case, report):
             if case == "publish":
                 assert timing["cache_disk_hit"], timing
                 assert timing["prefill_tokens"] < 64, timing
+                start = row["wait_start"]
+                releases = [event for event in wait_events("release")
+                            if event["request"] == start["request"]
+                            and event["checkpoint_id"] == start["checkpoint_id"]]
+                assert len(releases) == 1, releases
+                ended = releases[0]
+                assert ended["release"] == "not_pending", ended
+                assert 0 < float(ended["wait_ms"]) < float(start["limit_ms"]), (start, ended)
+                row["wait_release"] = ended
             else:
                 assert not timing["cache_disk_hit"], timing
                 assert timing["prefill_tokens"] > 4096, timing
