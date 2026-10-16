@@ -19,29 +19,6 @@ At 128K, AR pp improves 7.5% over post-#603 main, remaining 2.2% below the
 older 1529.63 tok/s result. MTP pp is within 0.9% of the historical 64K/128K
 results; 128K mixed/repetitive generation retains #603's gains.
 
-Publication-wait admission (#621), October 16: production main `22e36769`
-versus `1f9672af`, with the same pinned toolchain and a held 55K-token disk
-checkpoint. This focused control uses 1 GiB RAM, an 8 GiB disk tier, MTP,
-context 200192 and low reasoning; it measures admission and total HTTP latency.
-
-| Capture | Main admission | Candidate admission | Main total | Candidate total |
-| --- | ---: | ---: | ---: | ---: |
-| First pair | 120.018 s | 32.240 s | 151.787 s | 64.253 s |
-| Repeat | 120.017 s | 34.520 s | 152.944 s | 67.873 s |
-
-Early publication releases the same tracked checkpoint after 277.571 ms,
-before its 32.395 s budget, then restores it from disk. Waited/retried/cold answers are identical. Corresponding main/candidate
-requests retain the same token, cache and draft work. The portable regression is
-[`publication_wait.py`](../../../tests/functional/publication_wait.py).
-
-The standard pp2048/tg128 controls retain exact outputs, token/cache work and
-draft counts at d0/d32K, with context 65536, for AR and prose/repetitive MTP.
-The first repetitive MTP d32K pair is 48.50 → 46.02 tok/s (flagged); the focused
-repeat is 46.40 → 46.16 tok/s. Unchanged-main warmup/stall variation reproduces.
-All request/phase observations remain retained at 5% and 3 ms: timing evidence
-is **inconclusive and unqualified**, with no confirmed slowdown. This does not
-refresh the complete throughput card below or establish a global timing pass.
-
 ## Single user, autoregressive
 
 Approximately pp2048 / tg128; depth is the cached prefix in tokens.
