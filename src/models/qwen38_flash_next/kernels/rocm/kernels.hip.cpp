@@ -1114,16 +1114,11 @@ __global__ void HcCombineMoeF16Kernel(
       float4 n{0.0F, 0.0F, 0.0F, 0.0F};
       if (i < hidden) {
         const float4 gm = *reinterpret_cast<const float4*>(gamma + e);
-        if constexpr (kPrior) {
-          const float4 g =
-              float4{__fmul_rn(gm.x, scale[s]), __fmul_rn(gm.y, scale[s]),
-                     __fmul_rn(gm.z, scale[s]), __fmul_rn(gm.w, scale[s])};
-          n = float4{v[s][c].x * g.x, v[s][c].y * g.y, v[s][c].z * g.z,
-                     v[s][c].w * g.w};
-        } else {
-          n = float4{v[s][c].x * scale[s] * gm.x, v[s][c].y * scale[s] * gm.y,
-                     v[s][c].z * scale[s] * gm.z, v[s][c].w * scale[s] * gm.w};
-        }
+        const float4 g =
+            float4{__fmul_rn(gm.x, scale[s]), __fmul_rn(gm.y, scale[s]),
+                   __fmul_rn(gm.z, scale[s]), __fmul_rn(gm.w, scale[s])};
+        n = float4{__fmul_rn(v[s][c].x, g.x), __fmul_rn(v[s][c].y, g.y),
+                   __fmul_rn(v[s][c].z, g.z), __fmul_rn(v[s][c].w, g.w)};
         __half* out = xn + (static_cast<std::size_t>(t) * hc_dim) + e;
         const __half2 lo = __floats2half2_rn(n.x, n.y);
         const __half2 hi = __floats2half2_rn(n.z, n.w);
